@@ -5,6 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Dynamic Financial Tracker</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Chart.js for the Dashboard Timeline -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
+
     <!-- Firebase Imports -->
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
@@ -19,10 +23,11 @@
         let userId = null;
         let isAuthReady = false;
         let isPersistentMode = false; // Flag to track persistence state
+        let chartInstance = null; // Global instance for Chart.js
 
         // Make functions available globally for HTML event handlers
         window.saveContribution = saveContribution;
-        window.renderContributions = renderContributions; 
+        window.onMonthChange = onMonthChange; 
 
         // Global variables provided by the environment
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
@@ -33,6 +38,11 @@
         const START_DATE_STRING = '2025-04-21';
         const DAILY_CONTRIBUTION_DEFAULT = 50;
         const COLLECTION_PATH = `artifacts/${appId}/users/`;
+
+        // Cache for all contributions (used in persistent mode)
+        let contributionData = {}; 
+        let fullHistoryData = []; // Cache for calculated history
+        let monthsAvailable = []; // Cache for available months/years
 
         // Utility functions
         const formatDate = (date) => {
@@ -55,6 +65,8 @@
             return `${year}-${month}-${day}`;
         };
 
+        // --- FIREBASE INIT/AUTH LOGIC ---
+
         async function initFirebase() {
             const statusElement = document.getElementById('statusMessage');
             
@@ -71,7 +83,6 @@
                 isPersistentMode = true; // Enable persistence flag
                 statusElement.textContent = "Authenticating...";
 
-                // Sign in logic
                 await new Promise((resolve) => {
                     const unsubscribe = onAuthStateChanged(auth, async (user) => {
                         unsubscribe(); 
@@ -90,7 +101,6 @@
                                 } else {
                                     await signInAnonymously(auth);
                                 }
-                                // onAuthStateChanged will be triggered again with the user
                             } catch (error) {
                                 console.error("Firebase Auth failed:", error);
                                 statusElement.textContent = "Auth Failed";
@@ -101,7 +111,6 @@
                         }
                     });
                 });
-                
             } catch (error) {
                 console.error("Initialization error:", error);
                 statusElement.textContent = "Persistence DISABLED (Init Error)";
@@ -109,8 +118,6 @@
                 isPersistentMode = false;
             }
         }
-
-        let contributionData = {}; // Cache for all contributions (used in persistent mode)
 
         function setupSnapshotListener() {
             if (!isAuthReady || !userId || !isPersistentMode) return;
@@ -124,8 +131,8 @@
                     tempCache[doc.id] = doc.data();
                 });
                 contributionData = tempCache;
-                // Data loaded successfully from Firestore, now render using persistent data
-                renderContributions(); 
+                // Data loaded successfully from Firestore, now update the UI
+                updateUI(); 
             }, (error) => {
                 console.error("Error listening to Firestore:", error);
                 document.getElementById('statusMessage').textContent = "Data Fetch Error";
@@ -140,16 +147,18 @@
             const newPurchase = purchaseInput.value.trim();
             const newPurchaseAmount = parseFloat(purchaseAmountInput.value) || 0;
             
-            // Local update for immediate UI feedback (before potential Firestore refresh)
+            // 1. Local update for immediate UI feedback (before potential Firestore refresh)
             contributionData[dateKey] = {
                 amount: newAmount,
                 remark: newRemark,
                 purchase: newPurchase,
                 purchaseAmount: newPurchaseAmount
             };
-            renderContributions(); // Re-render instantly with local change
+            // Get current month selection before re-rendering
+            const currentMonthKey = document.getElementById('monthSelector')?.value;
+            updateUI(currentMonthKey); 
 
-            // Attempt to save remotely only if persistence is ready
+            // 2. Attempt to save remotely only if persistence is ready
             if (!isPersistentMode || !isAuthReady || !userId || !db) {
                 const saveError = document.getElementById('saveError');
                 saveError.textContent = `Cannot save: Persistence is disabled. Changes are temporary until refresh.`;
@@ -187,25 +196,32 @@
             }
         }
 
+        // --- UI RENDERING / DATA CALCULATION LOGIC ---
 
-        function renderContributions() {
-            
+        function calculateAndPrepareData() {
             const startDate = new Date(START_DATE_STRING);
             const today = new Date();
             today.setHours(0, 0, 0, 0);
 
             let cumulativeTotal = 0;
             let totalDays = 0;
-
-            const dataBody = document.getElementById('dataBody');
-            dataBody.innerHTML = ''; 
-
+            
+            fullHistoryData = [];
+            monthsAvailable = [];
+            let monthKeysSet = new Set();
+            
             let currentDate = new Date(startDate);
-
+            
             while (currentDate <= today) {
                 const dateKey = dateToKey(currentDate);
                 const dayOfWeek = currentDate.getDay(); // 0 is Sunday, 5 is Friday
                 const isFriday = dayOfWeek === 5;
+                
+                const monthKey = dateKey.substring(0, 7); // YYYY-MM
+                if (!monthKeysSet.has(monthKey)) {
+                    monthKeysSet.add(monthKey);
+                    monthsAvailable.push({ key: monthKey, label: new Date(monthKey + '-01').toLocaleString('default', { month: 'long', year: 'numeric' }) });
+                }
                 
                 // --- Default Values ---
                 let amount = DAILY_CONTRIBUTION_DEFAULT;
@@ -220,19 +236,99 @@
                 }
 
                 // --- Load Saved/Cached Data ---
-                // We use the contributionData cache regardless of persistence status for instant local updates.
                 if (contributionData[dateKey] !== undefined) {
                     const saved = contributionData[dateKey];
-                    amount = saved.amount !== undefined ? saved.amount : amount;
-                    remark = saved.remark !== undefined ? saved.remark : remark;
-                    purchase = saved.purchase !== undefined ? saved.purchase : purchase;
-                    purchaseAmount = saved.purchaseAmount !== undefined ? saved.purchaseAmount : purchaseAmount;
+                    // Using nullish coalescing to ensure defaults are kept if fields are missing in saved data
+                    amount = saved.amount ?? amount;
+                    remark = saved.remark ?? remark;
+                    purchase = saved.purchase ?? purchase;
+                    purchaseAmount = saved.purchaseAmount ?? purchaseAmount;
                 }
                 
                 // Update running totals
                 cumulativeTotal += amount;
                 cumulativeTotal -= purchaseAmount; 
                 totalDays++;
+                
+                // Save the full history point
+                fullHistoryData.push({
+                    dateKey,
+                    dateDisplay: formatDate(currentDate),
+                    isFriday,
+                    amount: amount,
+                    remark: remark,
+                    purchase: purchase,
+                    purchaseAmount: purchaseAmount,
+                    cumulativeTotal: cumulativeTotal,
+                    monthKey: monthKey,
+                });
+
+                // Move to the next day
+                currentDate.setDate(currentDate.getDate() + 1);
+            }
+            
+            return { 
+                totalDays, 
+                finalTotal: cumulativeTotal, 
+                history: fullHistoryData,
+                months: monthsAvailable
+            };
+        }
+
+        function updateUI(filterMonthKey = null) {
+            const { totalDays, finalTotal, history, months } = calculateAndPrepareData();
+            
+            // 1. Update Summary Cards
+            document.getElementById('daysCountDisplay').textContent = totalDays;
+            document.getElementById('totalContributionDisplay').textContent = finalTotal.toFixed(2);
+            
+            // 2. Populate Month Selector 
+            const monthSelector = document.getElementById('monthSelector');
+            if (monthSelector.options.length === 0 || months.length !== monthSelector.options.length) {
+                monthSelector.innerHTML = '';
+                months.reverse().forEach(month => { // Show newest months first
+                    const option = document.createElement('option');
+                    option.value = month.key;
+                    option.textContent = month.label;
+                    monthSelector.appendChild(option);
+                });
+            }
+            
+            // Set the month key filter, prioritizing the provided key, then the current selection, then the latest month
+            if (!filterMonthKey) {
+                filterMonthKey = monthSelector.value || months[0]?.key;
+            }
+
+            // Ensure selector is set to the determined key
+            if(filterMonthKey) monthSelector.value = filterMonthKey;
+
+
+            // 3. Render Table (Monthly View)
+            renderTable(history, filterMonthKey);
+
+            // 4. Render Chart (Full History View)
+            renderChart(history);
+        }
+
+        function onMonthChange(selectElement) {
+            updateUI(selectElement.value);
+        }
+
+        function renderTable(history, filterMonthKey) {
+            const dataBody = document.getElementById('dataBody');
+            dataBody.innerHTML = ''; 
+            const isReadonly = !isPersistentMode;
+
+            // Filter data to show only the selected month
+            const filteredHistory = history.filter(day => day.monthKey === filterMonthKey);
+            
+            if (filteredHistory.length === 0) {
+                dataBody.innerHTML = '<tr><td colspan="6" class="text-center py-8 text-gray-500">No data available for this month.</td></tr>';
+                return;
+            }
+
+            filteredHistory.forEach(day => {
+                const { dateKey, dateDisplay, isFriday, amount, remark, purchase, purchaseAmount, cumulativeTotal } = day;
                 
                 // --- UI Rendering ---
                 const row = document.createElement('tr');
@@ -242,10 +338,11 @@
                 const createInput = (type, value, placeholder, isSmall = false) => {
                     const input = document.createElement('input');
                     input.type = type;
-                    input.value = value;
+                    input.value = (type === 'number') ? amount.toFixed(2) : value; // Ensure number format on load
                     input.placeholder = placeholder;
+                    // Note: Inputs are always editable on the UI for quick updates, but saving depends on isPersistentMode
                     input.className = 'w-full text-center border rounded-md p-1 focus:ring-blue-500 focus:border-blue-500 ' + 
-                                      (isSmall ? 'text-xs' : 'text-sm font-mono');
+                                      (isSmall ? 'text-xs' : 'text-sm font-mono') + (!isPersistentMode ? ' bg-gray-100/50' : '');
                     return input;
                 };
 
@@ -264,17 +361,18 @@
 
 
                 // A. Date Cell
-                const dateCell = createCell(formatDate(currentDate));
+                const dateCell = createCell(dateDisplay);
                 if (isFriday) {
                     dateCell.classList.add('bg-yellow-100/50', 'font-semibold');
                     dateCell.textContent += ' (Fri)';
                 }
 
                 // B. Contribution Input
-                const amountInput = createInput('number', amount.toFixed(2), '50.00');
+                const amountInput = createInput('number', amount, '50.00');
                 amountInput.min = '0';
                 amountInput.step = '1';
-                createCell(amountInput, 'text-right w-1/12');
+                const amountCell = createCell(amountInput, 'text-right w-1/12');
+                if (amount === 0 && isFriday) amountCell.classList.add('bg-yellow-50');
 
                 // C. Remark Input
                 const remarkInput = createInput('text', remark, 'Add contribution remark', true);
@@ -285,44 +383,100 @@
                 createCell(purchaseInput, 'text-left w-2/12');
                 
                 // E. Purchase Amount Input
-                const purchaseAmountInput = createInput('number', purchaseAmount.toFixed(2), '0.00');
+                const purchaseAmountInput = createInput('number', purchaseAmount, '0.00');
                 purchaseAmountInput.min = '0';
                 purchaseAmountInput.step = '1';
-                createCell(purchaseAmountInput, 'text-right w-1/12');
+                const purchaseAmountCell = createCell(purchaseAmountInput, 'text-right w-1/12');
+                if (purchaseAmount > 0) purchaseAmountCell.classList.add('bg-red-50');
 
                 // F. Cumulative Subtotal Cell
                 createCell(cumulativeTotal.toFixed(2), 'text-green-700 font-extrabold text-right w-1/12 bg-green-50');
 
-                // Set event listeners to save on blur (when focus leaves the field)
+                // Set event listeners to save on blur 
                 const inputs = [amountInput, remarkInput, purchaseInput, purchaseAmountInput];
                 inputs.forEach(input => {
-                    input.onblur = (e) => saveContribution(dateKey, amountInput, remarkInput, purchaseInput, purchaseAmountInput);
+                    input.onblur = () => saveContribution(dateKey, amountInput, remarkInput, purchaseInput, purchaseAmountInput);
                 });
 
+                // Highlight today's row if visible
+                const todayKey = dateToKey(new Date());
+                if (dateKey === todayKey) {
+                    row.classList.add('total-row', 'border-4', 'border-green-300'); // Highlight today
+                    row.querySelector('td:first-child').textContent += ' (Today)';
+                }
 
                 dataBody.appendChild(row);
+            });
+        }
 
-                // Move to the next day
-                currentDate.setDate(currentDate.getDate() + 1);
+        function renderChart(history) {
+            const chartCanvas = document.getElementById('cumulativeChart');
+            if (!chartCanvas) return;
+
+            // Prepare data for Chart.js
+            // Chart shows ALL history, not just the filtered month
+            const chartLabels = history.map(d => d.dateDisplay.substring(0, d.dateDisplay.length - 5)); // Remove year
+            const chartDataPoints = history.map(d => d.cumulativeTotal);
+
+            const data = {
+                labels: chartLabels,
+                datasets: [{
+                    label: 'Net Cumulative Total (RM)',
+                    data: chartDataPoints,
+                    fill: true,
+                    borderColor: 'rgb(52, 211, 153)', // Tailwind green-400
+                    backgroundColor: 'rgba(52, 211, 153, 0.2)',
+                    tension: 0.2, // Make the line smoother
+                    pointRadius: 0 // Hide individual points
+                }]
+            };
+
+            const config = {
+                type: 'line',
+                data: data,
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { display: false },
+                        title: { display: true, text: 'Net Cumulative Total Over Time', font: { size: 14 } }
+                    },
+                    scales: {
+                        x: {
+                            title: { display: true, text: 'Date' },
+                            ticks: {
+                                autoSkip: true,
+                                maxTicksLimit: 10, // Limit ticks to avoid clutter
+                                maxRotation: 0,
+                                minRotation: 0,
+                                // Show only a few ticks on the x-axis
+                                callback: function(val, index) {
+                                    // Show a tick label roughly every N days for clean look
+                                    const N = Math.ceil(chartLabels.length / 8);
+                                    return (index % N) === 0 ? this.getLabelForValue(val) : '';
+                                }
+                            }
+                        },
+                        y: {
+                            title: { display: true, text: 'Amount (RM)' },
+                            beginAtZero: true
+                        }
+                    }
+                }
+            };
+
+            if (chartInstance) {
+                chartInstance.data = data;
+                chartInstance.update();
+            } else {
+                chartInstance = new Chart(chartCanvas, config);
             }
-
-            // Highlight the final row as the dynamic subtotal
-            if (dataBody.lastChild) {
-                dataBody.lastChild.classList.add('total-row');
-                dataBody.lastChild.querySelector('td:first-child').textContent += ' (Today)';
-            }
-
-            // Update summary cards
-            const startDateFormatted = formatDate(startDate);
-            document.getElementById('startDateDisplay').textContent = startDateFormatted;
-            document.getElementById('daysCountDisplay').textContent = totalDays;
-            document.getElementById('totalContributionDisplay').textContent = cumulativeTotal.toFixed(2);
         }
 
         // --- INITIALIZATION LOGIC ---
         document.addEventListener('DOMContentLoaded', () => {
             // 1. GUARANTEED initial render: Display calculated data immediately
-            renderContributions();
+            updateUI(); 
             // 2. Then, start the asynchronous Firebase setup
             initFirebase();
         });
@@ -355,6 +509,7 @@
         input[type="text"], input[type="number"] {
             padding: 0.25rem 0.5rem;
             height: 2rem;
+            min-width: 0; /* Allow inputs to shrink */
         }
     </style>
 </head>
@@ -376,21 +531,36 @@
             </span>
         </div>
 
-        <!-- Summary Statistics Card -->
+        <!-- Summary Statistics Card and Chart -->
         <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
-            <div class="bg-blue-50 p-4 rounded-lg shadow">
-                <p class="text-sm font-medium text-blue-600">Start Date</p>
-                <p id="startDateDisplay" class="text-lg font-semibold text-blue-800">...</p>
+            <!-- 1. CHART CONTAINER (Replacing Start Date Card) -->
+            <div class="md:col-span-2 bg-white p-4 rounded-lg shadow border border-gray-100 h-80">
+                <div class="h-full w-full">
+                    <canvas id="cumulativeChart"></canvas>
+                </div>
             </div>
-            <div class="bg-purple-50 p-4 rounded-lg shadow">
-                <p class="text-sm font-medium text-purple-600">Days Tracked</p>
-                <p id="daysCountDisplay" class="text-lg font-semibold text-purple-800">...</p>
-            </div>
-            <div class="bg-green-500 p-4 rounded-lg shadow">
-                <p class="text-sm font-medium text-white">NET CUMULATIVE TOTAL (RM)</p>
-                <p id="totalContributionDisplay" class="text-2xl font-extrabold text-white">...</p>
+
+            <!-- 2. SUMMARY STATS -->
+            <div class="flex flex-col space-y-4">
+                <div class="bg-purple-50 p-4 rounded-lg shadow">
+                    <p class="text-sm font-medium text-purple-600">Days Tracked</p>
+                    <p id="daysCountDisplay" class="text-2xl font-semibold text-purple-800">...</p>
+                </div>
+                <div class="bg-green-500 p-4 rounded-lg shadow flex-grow">
+                    <p class="text-sm font-medium text-white">NET CUMULATIVE TOTAL (RM)</p>
+                    <p id="totalContributionDisplay" class="text-4xl font-extrabold text-white">...</p>
+                </div>
             </div>
         </div>
+        
+        <!-- MONTHLY FILTER AND TABLE -->
+        <div class="mb-4 flex items-center space-x-3">
+            <label for="monthSelector" class="text-sm font-medium text-gray-700">View Month:</label>
+            <select id="monthSelector" onchange="onMonthChange(this)" class="p-2 border border-gray-300 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500">
+                <!-- Options populated by JavaScript -->
+            </select>
+        </div>
+
 
         <div class="overflow-x-auto rounded-lg border border-gray-200">
             <table class="min-w-full divide-y divide-gray-200">
