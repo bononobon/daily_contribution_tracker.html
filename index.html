@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dynamic Financial Tracker</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Firebase Imports -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot, collection, query } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        // setLogLevel is available but kept commented out for cleaner console
+
+        // IMPORTANT: Global variables must be defined before use
+        let app = null;
+        let db = null;
+        let auth = null;
+        let userId = null;
+        let isAuthReady = false;
+        let isPersistentMode = false; // Flag to track persistence state
+
+        // Make functions available globally for HTML event handlers
+        window.saveContribution = saveContribution;
+        window.renderContributions = renderContributions; 
+
+        // Global variables provided by the environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        // Constants
+        const START_DATE_STRING = '2025-04-21';
+        const DAILY_CONTRIBUTION_DEFAULT = 50;
+        const COLLECTION_PATH = `artifacts/${appId}/users/`;
+
+        // Utility functions
+        const formatDate = (date) => {
+            const d = new Date(date);
+            let day = d.getDate();
+            let month = d.getMonth() + 1;
+            const year = d.getFullYear();
+            if (day < 10) day = '0' + day;
+            if (month < 10) month = '0' + month;
+            return `${day}/${month}/${year}`;
+        };
+        
+        const dateToKey = (date) => {
+            const d = new Date(date);
+            let month = d.getMonth() + 1;
+            let day = d.getDate();
+            const year = d.getFullYear();
+            if (day < 10) day = '0' + day;
+            if (month < 10) month = '0' + month;
+            return `${year}-${month}-${day}`;
+        };
+
+        async function initFirebase() {
+            const statusElement = document.getElementById('statusMessage');
+            
+            if (Object.keys(firebaseConfig).length === 0) {
+                statusElement.textContent = "Persistence DISABLED (Config Missing)";
+                statusElement.classList.replace('text-blue-600', 'text-red-600');
+                return;
+            }
+
+            try {
+                app = initializeApp(firebaseConfig);
+                auth = getAuth(app);
+                db = getFirestore(app);
+                isPersistentMode = true; // Enable persistence flag
+                statusElement.textContent = "Authenticating...";
+
+                // Sign in logic
+                await new Promise((resolve) => {
+                    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+                        unsubscribe(); 
+                        if (user) {
+                            userId = user.uid;
+                            isAuthReady = true;
+                            document.getElementById('userIdDisplay').textContent = userId;
+                            statusElement.textContent = "Persistent Mode Ready";
+                            statusElement.classList.replace('text-blue-600', 'text-green-600');
+                            setupSnapshotListener(); 
+                            resolve();
+                        } else {
+                             try {
+                                if (initialAuthToken) {
+                                    await signInWithCustomToken(auth, initialAuthToken);
+                                } else {
+                                    await signInAnonymously(auth);
+                                }
+                                // onAuthStateChanged will be triggered again with the user
+                            } catch (error) {
+                                console.error("Firebase Auth failed:", error);
+                                statusElement.textContent = "Auth Failed";
+                                statusElement.classList.replace('text-blue-600', 'text-red-600');
+                                isPersistentMode = false;
+                                resolve(); 
+                            }
+                        }
+                    });
+                });
+                
+            } catch (error) {
+                console.error("Initialization error:", error);
+                statusElement.textContent = "Persistence DISABLED (Init Error)";
+                statusElement.classList.replace('text-blue-600', 'text-red-600');
+                isPersistentMode = false;
+            }
+        }
+
+        let contributionData = {}; // Cache for all contributions (used in persistent mode)
+
+        function setupSnapshotListener() {
+            if (!isAuthReady || !userId || !isPersistentMode) return;
+
+            const contributionsRef = collection(db, COLLECTION_PATH + userId + "/contributions");
+            const q = query(contributionsRef); 
+
+            onSnapshot(q, (snapshot) => {
+                let tempCache = {};
+                snapshot.forEach((doc) => {
+                    tempCache[doc.id] = doc.data();
+                });
+                contributionData = tempCache;
+                // Data loaded successfully from Firestore, now render using persistent data
+                renderContributions(); 
+            }, (error) => {
+                console.error("Error listening to Firestore:", error);
+                document.getElementById('statusMessage').textContent = "Data Fetch Error";
+                document.getElementById('statusMessage').classList.replace('text-green-600', 'text-red-600');
+            });
+        }
+
+        async function saveContribution(dateKey, amountInput, remarkInput, purchaseInput, purchaseAmountInput) {
+            
+            const newAmount = parseFloat(amountInput.value) || 0;
+            const newRemark = remarkInput.value.trim();
+            const newPurchase = purchaseInput.value.trim();
+            const newPurchaseAmount = parseFloat(purchaseAmountInput.value) || 0;
+            
+            // Local update for immediate UI feedback (before potential Firestore refresh)
+            contributionData[dateKey] = {
+                amount: newAmount,
+                remark: newRemark,
+                purchase: newPurchase,
+                purchaseAmount: newPurchaseAmount
+            };
+            renderContributions(); // Re-render instantly with local change
+
+            // Attempt to save remotely only if persistence is ready
+            if (!isPersistentMode || !isAuthReady || !userId || !db) {
+                const saveError = document.getElementById('saveError');
+                saveError.textContent = `Cannot save: Persistence is disabled. Changes are temporary until refresh.`;
+                saveError.classList.remove('hidden');
+                setTimeout(() => saveError.classList.add('hidden'), 3000);
+                return;
+            }
+
+            if (isNaN(newAmount) || newAmount < 0 || isNaN(newPurchaseAmount) || newPurchaseAmount < 0) {
+                console.warn("Invalid number entered.");
+                return;
+            }
+
+            const contributionDocRef = doc(db, COLLECTION_PATH + userId + "/contributions", dateKey);
+
+            try {
+                await setDoc(contributionDocRef, {
+                    date: dateKey,
+                    amount: newAmount,
+                    remark: newRemark || 'User-defined contribution',
+                    purchase: newPurchase || '',
+                    purchaseAmount: newPurchaseAmount || 0,
+                });
+                
+                // Visual feedback on success
+                amountInput.classList.add('border-green-500', 'ring-1', 'ring-green-500');
+                setTimeout(() => {
+                    amountInput.classList.remove('border-green-500', 'ring-1', 'ring-green-500');
+                }, 1000);
+
+            } catch (error) {
+                console.error("Error saving contribution:", error);
+                // Visual feedback on error
+                amountInput.classList.add('border-red-500', 'ring-1', 'ring-red-500');
+            }
+        }
+
+
+        function renderContributions() {
+            
+            const startDate = new Date(START_DATE_STRING);
+            const today = new Date();
+            today.setHours(0, 0, 0, 0);
+
+            let cumulativeTotal = 0;
+            let totalDays = 0;
+
+            const dataBody = document.getElementById('dataBody');
+            dataBody.innerHTML = ''; 
+
+            let currentDate = new Date(startDate);
+
+            while (currentDate <= today) {
+                const dateKey = dateToKey(currentDate);
+                const dayOfWeek = currentDate.getDay(); // 0 is Sunday, 5 is Friday
+                const isFriday = dayOfWeek === 5;
+                
+                // --- Default Values ---
+                let amount = DAILY_CONTRIBUTION_DEFAULT;
+                let remark = 'Standard Contribution';
+                let purchase = '';
+                let purchaseAmount = 0;
+
+                // Apply Friday rule
+                if (isFriday) {
+                    amount = 0;
+                    remark = 'Off Day (Automated)';
+                }
+
+                // --- Load Saved/Cached Data ---
+                // We use the contributionData cache regardless of persistence status for instant local updates.
+                if (contributionData[dateKey] !== undefined) {
+                    const saved = contributionData[dateKey];
+                    amount = saved.amount !== undefined ? saved.amount : amount;
+                    remark = saved.remark !== undefined ? saved.remark : remark;
+                    purchase = saved.purchase !== undefined ? saved.purchase : purchase;
+                    purchaseAmount = saved.purchaseAmount !== undefined ? saved.purchaseAmount : purchaseAmount;
+                }
+                
+                // Update running totals
+                cumulativeTotal += amount;
+                cumulativeTotal -= purchaseAmount; 
+                totalDays++;
+                
+                // --- UI Rendering ---
+                const row = document.createElement('tr');
+                row.className = 'hover:bg-gray-50';
+                
+                // Helper to create input with class
+                const createInput = (type, value, placeholder, isSmall = false) => {
+                    const input = document.createElement('input');
+                    input.type = type;
+                    input.value = value;
+                    input.placeholder = placeholder;
+                    input.className = 'w-full text-center border rounded-md p-1 focus:ring-blue-500 focus:border-blue-500 ' + 
+                                      (isSmall ? 'text-xs' : 'text-sm font-mono');
+                    return input;
+                };
+
+                // Helper to create and append table cell
+                const createCell = (content, className = '') => {
+                    const cell = document.createElement('td');
+                    cell.className = `px-3 py-1 whitespace-nowrap text-sm text-gray-900 ${className}`;
+                    if (typeof content === 'string') {
+                        cell.textContent = content;
+                    } else {
+                        cell.appendChild(content);
+                    }
+                    row.appendChild(cell);
+                    return cell;
+                };
+
+
+                // A. Date Cell
+                const dateCell = createCell(formatDate(currentDate));
+                if (isFriday) {
+                    dateCell.classList.add('bg-yellow-100/50', 'font-semibold');
+                    dateCell.textContent += ' (Fri)';
+                }
+
+                // B. Contribution Input
+                const amountInput = createInput('number', amount.toFixed(2), '50.00');
+                amountInput.min = '0';
+                amountInput.step = '1';
+                createCell(amountInput, 'text-right w-1/12');
+
+                // C. Remark Input
+                const remarkInput = createInput('text', remark, 'Add contribution remark', true);
+                createCell(remarkInput, 'text-left w-2/12');
+                
+                // D. Purchase Item Input
+                const purchaseInput = createInput('text', purchase, 'e.g., New Gadget', true);
+                createCell(purchaseInput, 'text-left w-2/12');
+                
+                // E. Purchase Amount Input
+                const purchaseAmountInput = createInput('number', purchaseAmount.toFixed(2), '0.00');
+                purchaseAmountInput.min = '0';
+                purchaseAmountInput.step = '1';
+                createCell(purchaseAmountInput, 'text-right w-1/12');
+
+                // F. Cumulative Subtotal Cell
+                createCell(cumulativeTotal.toFixed(2), 'text-green-700 font-extrabold text-right w-1/12 bg-green-50');
+
+                // Set event listeners to save on blur (when focus leaves the field)
+                const inputs = [amountInput, remarkInput, purchaseInput, purchaseAmountInput];
+                inputs.forEach(input => {
+                    input.onblur = (e) => saveContribution(dateKey, amountInput, remarkInput, purchaseInput, purchaseAmountInput);
+                });
+
+
+                dataBody.appendChild(row);
+
+                // Move to the next day
+                currentDate.setDate(currentDate.getDate() + 1);
+            }
+
+            // Highlight the final row as the dynamic subtotal
+            if (dataBody.lastChild) {
+                dataBody.lastChild.classList.add('total-row');
+                dataBody.lastChild.querySelector('td:first-child').textContent += ' (Today)';
+            }
+
+            // Update summary cards
+            const startDateFormatted = formatDate(startDate);
+            document.getElementById('startDateDisplay').textContent = startDateFormatted;
+            document.getElementById('daysCountDisplay').textContent = totalDays;
+            document.getElementById('totalContributionDisplay').textContent = cumulativeTotal.toFixed(2);
+        }
+
+        // --- INITIALIZATION LOGIC ---
+        document.addEventListener('DOMContentLoaded', () => {
+            // 1. GUARANTEED initial render: Display calculated data immediately
+            renderContributions();
+            // 2. Then, start the asynchronous Firebase setup
+            initFirebase();
+        });
+        // --- END INITIALIZATION LOGIC ---
+    </script>
+    <style>
+        /* Custom styles for professional, spreadsheet look */
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f7f9fc;
+        }
+        .container {
+            max-width: 1200px; /* Wider container for 6 columns */
+            margin: 2rem auto;
+            padding: 20px;
+            background: white;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.06);
+            border-radius: 12px;
+        }
+        .header-cell {
+            background-color: #e5e7eb; /* Light gray for headers */
+            font-weight: 600;
+        }
+        .total-row {
+            background-color: #d1fae5; /* Light green for the total row */
+            font-weight: 700;
+            font-size: 1.125rem;
+        }
+        /* Ensure inputs look good */
+        input[type="text"], input[type="number"] {
+            padding: 0.25rem 0.5rem;
+            height: 2rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1 class="text-3xl font-bold text-gray-800 mb-2">Dynamic Contribution & Spending Tracker</h1>
+        <p class="text-gray-500 mb-2">Editable tracker starting from April 21st, 2025. Fridays default to RM0.</p>
+        
+        <div class="text-sm mb-4 p-3 bg-red-100 border border-red-400 text-red-700 rounded-lg hidden" id="saveError">
+            ⚠️ **Saving Disabled:** Persistence is not active. Changes are temporary.
+        </div>
+
+        <div class="text-sm text-gray-500 mb-6 flex justify-between items-center">
+            <span>
+                User ID: <span id="userIdDisplay" class="font-mono text-xs bg-gray-100 p-1 rounded">N/A</span> 
+            </span>
+            <span>
+                Status: <span id="statusMessage" class="font-medium text-blue-600">Initializing...</span>
+            </span>
+        </div>
+
+        <!-- Summary Statistics Card -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+            <div class="bg-blue-50 p-4 rounded-lg shadow">
+                <p class="text-sm font-medium text-blue-600">Start Date</p>
+                <p id="startDateDisplay" class="text-lg font-semibold text-blue-800">...</p>
+            </div>
+            <div class="bg-purple-50 p-4 rounded-lg shadow">
+                <p class="text-sm font-medium text-purple-600">Days Tracked</p>
+                <p id="daysCountDisplay" class="text-lg font-semibold text-purple-800">...</p>
+            </div>
+            <div class="bg-green-500 p-4 rounded-lg shadow">
+                <p class="text-sm font-medium text-white">NET CUMULATIVE TOTAL (RM)</p>
+                <p id="totalContributionDisplay" class="text-2xl font-extrabold text-white">...</p>
+            </div>
+        </div>
+
+        <div class="overflow-x-auto rounded-lg border border-gray-200">
+            <table class="min-w-full divide-y divide-gray-200">
+                <thead>
+                    <tr>
+                        <th class="px-3 py-3 text-left text-xs text-gray-700 uppercase tracking-wider header-cell rounded-tl-lg w-1/12">
+                            Date
+                        </th>
+                        <th class="px-3 py-3 text-center text-xs text-gray-700 uppercase tracking-wider header-cell w-1/12">
+                            Contribution (RM) 
+                        </th>
+                        <th class="px-3 py-3 text-left text-xs text-gray-700 uppercase tracking-wider header-cell w-2/12">
+                            Remark
+                        </th>
+                        <th class="px-3 py-3 text-left text-xs text-gray-700 uppercase tracking-wider header-cell w-2/12">
+                            Purchase Item
+                        </th>
+                        <th class="px-3 py-3 text-center text-xs text-gray-700 uppercase tracking-wider header-cell w-1/12">
+                            Purchase Amount (RM)
+                        </th>
+                        <th class="px-3 py-3 text-right text-xs text-gray-700 uppercase tracking-wider header-cell rounded-tr-lg w-1/12">
+                            Net Cumulative (RM)
+                        </th>
+                    </tr>
+                </thead>
+                <tbody id="dataBody" class="bg-white divide-y divide-gray-100">
+                    <!-- Data rows will be inserted here by JavaScript -->
+                </tbody>
+            </table>
+        </div>
+        <p class="mt-4 text-sm text-gray-500">Edit any cell to update the tracker. If persistence is active, changes are automatically saved.</p>
+    </div>
+</body>
+</html>
